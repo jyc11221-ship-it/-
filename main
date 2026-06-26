@@ -1,0 +1,1270 @@
+import os
+import sys
+import math
+import pickle
+import warnings
+
+warnings.filterwarnings('ignore')
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression as SklearnLinear
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_regression
+
+from datasets import load_dataset
+
+
+# ============================================================
+# 1. 数据加载与预处理
+# ============================================================
+
+class WindDataLoader:
+    """风速数据加载与预处理类"""
+
+    def __init__(self, data_dir: str = "./data/raw"):
+        self.data_dir = data_dir
+        os.makedirs(data_dir, exist_ok=True)
+        self.scaler = StandardScaler()
+
+    def download_data(self, force_download: bool = False) -> dict:
+        """从Hugging Face下载三个高度的数据集"""
+        print("正在从Hugging Face下载数据...")
+
+        datasets_dict = {}
+        heights = {
+            '10m': 'Antajitters/WindSpeed_10m',
+            '50m': 'Antajitters/WindSpeed_50m',
+            '100m': 'Antajitters/WindSpeed_100m'
+        }
+
+        for name, repo in heights.items():
+            print(f"  下载 {name} 数据集...")
+            try:
+                dataset = load_dataset(repo, split='train',
+                                       cache_dir=self.data_dir,
+                                       force_redownload=force_download)
+                df = dataset.to_pandas()
+                datasets_dict[name] = df
+                print(f"    {name}: {len(df)} 行, {len(df.columns)} 列")
+            except Exception as e:
+                print(f"    下载失败: {e}")
+                local_path = os.path.join(self.data_dir, f"WindSpeed_{name}.parquet")
+                if os.path.exists(local_path):
+                    df = pd.read_parquet(local_path)
+                    datasets_dict[name] = df
+                    print(f"    从本地加载: {len(df)} 行")
+                else:
+                    raise FileNotFoundError(f"无法加载数据集 {name}")
+
+        return datasets_dict
+
+    def inspect_data(self, dfs: dict) -> dict:
+        """查看数据基本信息"""
+        info = {}
+        for name, df in dfs.items():
+            info[name] = {
+                'shape': df.shape,
+                'columns': df.columns.tolist(),
+                'null_counts': df.isnull().sum().to_dict(),
+            }
+            print(f"\n=== {name} 数据集 ===")
+            print(f"形状: {df.shape}")
+            print(f"列: {df.columns.tolist()}")
+            print(f"空值: {df.isnull().sum().sum()}")
+            print(df.head(2))
+        return info
+
+    def parse_timestamp(self, df: pd.DataFrame) -> pd.DataFrame:
+        """解析时间戳并设置为索引"""
+        df = df.copy()
+
+        timestamp_cols = ['日期与时间戳', 'Timestamp', 'timestamp', 'time', 'date']
+        ts_col = None
+
+        for col in timestamp_cols:
+            if col in df.columns:
+                ts_col = col
+                break
+
+        if ts_col is None:
+            for col in df.columns:
+                if 'time' in col.lower() or 'date' in col.lower() or 'timestamp' in col.lower():
+                    ts_col = col
+                    break
+
+        if ts_col is None:
+            raise ValueError("未找到时间戳列，请检查数据列名")
+
+        print(f"使用时间戳列: {ts_col}")
+
+        df['datetime'] = pd.to_datetime(df[ts_col])
+        df = df.sort_values('datetime')
+        df = df.set_index('datetime')
+        df = df.drop(columns=[ts_col])
+
+        return df
+
+    def clean_data(self, df: pd.DataFrame, method: str = 'interpolate') -> pd.DataFrame:
+        """数据清洗：处理缺失值和异常值"""
+        df = df.copy()
+
+        null_count = df.isnull().sum().sum()
+        if null_count > 0:
+            print(f"  发现 {null_count} 个缺失值")
+            if method == 'interpolate':
+                df = df.interpolate(method='linear', limit_direction='both')
+            elif method == 'ffill':
+                df = df.fillna(method='ffill').fillna(method='bfill')
+            elif method == 'drop':
+                df = df.dropna()
+
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            mean = df[col].mean()
+            std = df[col].std()
+            if std > 0:
+                lower_bound = mean - 3 * std
+                upper_bound = mean + 3 * std
+                outliers = (df[col] < lower_bound) | (df[col] > upper_bound)
+                if outliers.sum() > 0:
+                    print(f"  列 {col} 发现 {outliers.sum()} 个异常值，已截断")
+                    df[col] = df[col].clip(lower_bound, upper_bound)
+
+        print(f"  清洗后: {len(df)} 行")
+        return df
+
+    def merge_datasets(self, dfs: dict) -> pd.DataFrame:
+        """按时间戳合并三个高度的数据"""
+        print("\n正在合并三个高度的数据...")
+
+        merged = None
+
+        for name, df in dfs.items():
+            df_clean = self.parse_timestamp(df)
+            df_clean = self.clean_data(df_clean)
+
+            rename_dict = {}
+            for col in df_clean.columns:
+                if col not in ['datetime']:
+                    rename_dict[col] = f"{name}_{col}"
+            df_clean = df_clean.rename(columns=rename_dict)
+
+            if merged is None:
+                merged = df_clean
+            else:
+                merged = merged.join(df_clean, how='inner')
+
+        print(f"合并后数据形状: {merged.shape}")
+        print(f"时间范围: {merged.index.min()} 到 {merged.index.max()}")
+
+        return merged
+
+    def split_data(self, df: pd.DataFrame,
+                   train_ratio: float = 0.7,
+                   val_ratio: float = 0.2,
+                   test_ratio: float = 0.1) -> tuple:
+        """按时间顺序划分数据集"""
+        assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6
+
+        n = len(df)
+        train_end = int(n * train_ratio)
+        val_end = int(n * (train_ratio + val_ratio))
+
+        train_df = df.iloc[:train_end]
+        val_df = df.iloc[train_end:val_end]
+        test_df = df.iloc[val_end:]
+
+        print(f"\n数据集划分:")
+        print(f"  训练集: {len(train_df)} 行 ({train_ratio * 100:.0f}%)")
+        print(f"  验证集: {len(val_df)} 行 ({val_ratio * 100:.0f}%)")
+        print(f"  测试集: {len(test_df)} 行 ({test_ratio * 100:.0f}%)")
+
+        return train_df, val_df, test_df
+
+    def add_time_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """添加时间特征"""
+        df = df.copy()
+        if df.index is not None and isinstance(df.index, pd.DatetimeIndex):
+            df['hour'] = df.index.hour
+            df['day_of_week'] = df.index.dayofweek
+            df['day_of_year'] = df.index.dayofyear
+            df['month'] = df.index.month
+            df['hour_sin'] = np.sin(2 * np.pi * df.index.hour / 24)
+            df['hour_cos'] = np.cos(2 * np.pi * df.index.hour / 24)
+            df['day_sin'] = np.sin(2 * np.pi * df.index.dayofweek / 7)
+            df['day_cos'] = np.cos(2 * np.pi * df.index.dayofweek / 7)
+        return df
+
+    def create_sequences(self,
+                         data: pd.DataFrame,
+                         target_col: str,
+                         seq_length: int = 48,
+                         pred_steps: int = 6,
+                         feature_cols: list = None) -> tuple:
+        """创建时间序列样本"""
+        if feature_cols is None:
+            feature_cols = data.select_dtypes(include=[np.number]).columns.tolist()
+            if target_col not in feature_cols:
+                feature_cols.append(target_col)
+
+        values = data[feature_cols].values
+        target_idx = feature_cols.index(target_col) if target_col in feature_cols else 0
+
+        X, y, timestamps = [], [], []
+
+        for i in range(len(data) - seq_length - pred_steps + 1):
+            X.append(values[i:i + seq_length])
+            y.append(values[i + seq_length:i + seq_length + pred_steps, target_idx])
+            timestamps.append(data.index[i + seq_length])
+
+        return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32), np.array(timestamps)
+
+    def prepare_data(self,
+                     target_col: str = '10m_速度平均',
+                     seq_length: int = 48,
+                     pred_steps: int = 6,
+                     normalize: bool = True) -> dict:
+        """完整的数据准备流程"""
+        dfs = self.download_data()
+        self.inspect_data(dfs)
+
+        merged_df = self.merge_datasets(dfs)
+
+        merged_path = os.path.join(self.data_dir, "../processed/merged_data.parquet")
+        os.makedirs(os.path.dirname(merged_path), exist_ok=True)
+        merged_df.to_parquet(merged_path)
+        print(f"合并数据已保存到: {merged_path}")
+
+        train_df, val_df, test_df = self.split_data(merged_df)
+
+        for df in [train_df, val_df, test_df]:
+            df = self.add_time_features(df)
+
+        if normalize:
+            train_values = train_df.select_dtypes(include=[np.number]).values
+            self.scaler.fit(train_values)
+
+            for df in [train_df, val_df, test_df]:
+                numeric_cols = df.select_dtypes(include=[np.number]).columns
+                df[numeric_cols] = self.scaler.transform(df[numeric_cols].values)
+
+        feature_cols = train_df.select_dtypes(include=[np.number]).columns.tolist()
+
+        X_train, y_train, ts_train = self.create_sequences(
+            train_df, target_col, seq_length, pred_steps, feature_cols
+        )
+        X_val, y_val, ts_val = self.create_sequences(
+            val_df, target_col, seq_length, pred_steps, feature_cols
+        )
+        X_test, y_test, ts_test = self.create_sequences(
+            test_df, target_col, seq_length, pred_steps, feature_cols
+        )
+
+        print(f"\n序列数据形状:")
+        print(f"  X_train: {X_train.shape}, y_train: {y_train.shape}")
+        print(f"  X_val: {X_val.shape}, y_val: {y_val.shape}")
+        print(f"  X_test: {X_test.shape}, y_test: {y_test.shape}")
+
+        return {
+            'X_train': X_train, 'y_train': y_train,
+            'X_val': X_val, 'y_val': y_val,
+            'X_test': X_test, 'y_test': y_test,
+            'train_timestamps': ts_train,
+            'val_timestamps': ts_val,
+            'test_timestamps': ts_test,
+            'feature_cols': feature_cols,
+            'target_col': target_col,
+            'scaler': self.scaler,
+            'merged_df': merged_df,
+            'train_df': train_df,
+            'val_df': val_df,
+            'test_df': test_df
+        }
+
+
+# ============================================================
+# 2. 线性回归模型
+# ============================================================
+
+class LinearRegressionModel:
+    """封装线性回归模型，支持多步预测"""
+
+    def __init__(self, model_dir: str = "./checkpoints"):
+        self.model = None
+        self.model_dir = model_dir
+        os.makedirs(model_dir, exist_ok=True)
+        self.is_fitted = False
+
+    def _flatten_input(self, X: np.ndarray) -> np.ndarray:
+        if len(X.shape) == 3:
+            return X.reshape(X.shape[0], -1)
+        return X
+
+    def fit(self, X_train: np.ndarray, y_train: np.ndarray):
+        X_flat = self._flatten_input(X_train)
+        self.model = MultiOutputRegressor(SklearnLinear(n_jobs=-1))
+        self.model.fit(X_flat, y_train)
+        self.is_fitted = True
+        print(f"线性回归训练完成，输入维度: {X_flat.shape[1]}")
+        return self
+
+    def predict(self, X_test: np.ndarray) -> np.ndarray:
+        if not self.is_fitted:
+            raise ValueError("模型尚未训练")
+        X_flat = self._flatten_input(X_test)
+        return self.model.predict(X_flat)
+
+    def evaluate(self, X_test: np.ndarray, y_test: np.ndarray) -> dict:
+        y_pred = self.predict(X_test)
+
+        mse = mean_squared_error(y_test, y_pred)
+        rmse = np.sqrt(mse)
+        mae = mean_absolute_error(y_test, y_pred)
+        r2 = r2_score(y_test, y_pred)
+
+        step_metrics = []
+        for step in range(y_test.shape[1]):
+            step_mse = mean_squared_error(y_test[:, step], y_pred[:, step])
+            step_mae = mean_absolute_error(y_test[:, step], y_pred[:, step])
+            step_metrics.append({'step': step, 'mse': step_mse, 'mae': step_mae})
+
+        metrics = {'mse': mse, 'rmse': rmse, 'mae': mae, 'r2': r2, 'step_metrics': step_metrics}
+
+        print(f"\n线性回归评估结果:")
+        print(f"  MSE: {mse:.6f}")
+        print(f"  RMSE: {rmse:.6f}")
+        print(f"  MAE: {mae:.6f}")
+        print(f"  R²: {r2:.6f}")
+
+        return metrics
+
+    def save(self, filename: str = "linear_model.pkl"):
+        path = os.path.join(self.model_dir, filename)
+        with open(path, 'wb') as f:
+            pickle.dump(self.model, f)
+        print(f"模型已保存到: {path}")
+
+    def load(self, filename: str = "linear_model.pkl"):
+        path = os.path.join(self.model_dir, filename)
+        with open(path, 'rb') as f:
+            self.model = pickle.load(f)
+        self.is_fitted = True
+        print(f"模型已从 {path} 加载")
+        return self
+
+
+# ============================================================
+# 3. LSTM模型
+# ============================================================
+
+class LSTMModel(nn.Module):
+    """LSTM时间序列预测模型"""
+
+    def __init__(self, input_size: int, hidden_size: int = 64,
+                 num_layers: int = 2, output_size: int = 6, dropout: float = 0.2):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        last_output = lstm_out[:, -1, :]
+        last_output = self.dropout(last_output)
+        output = self.fc(last_output)
+        return output
+
+
+class LSTMEngine:
+    """LSTM模型训练和评估引擎"""
+
+    def __init__(self, input_size: int, output_size: int = 6,
+                 hidden_size: int = 64, num_layers: int = 2,
+                 learning_rate: float = 1e-3, batch_size: int = 64,
+                 num_epochs: int = 100, device: str = 'cuda',
+                 model_dir: str = "./checkpoints"):
+
+        self.input_size = input_size
+        self.output_size = output_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.num_epochs = num_epochs
+        self.device = device if torch.cuda.is_available() else 'cpu'
+        self.model_dir = model_dir
+        os.makedirs(model_dir, exist_ok=True)
+
+        self.model = None
+        self.optimizer = None
+        self.criterion = nn.MSELoss()
+        self.train_losses = []
+        self.val_losses = []
+
+        print(f"使用设备: {self.device}")
+
+    def _build_model(self):
+        self.model = LSTMModel(
+            input_size=self.input_size,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            output_size=self.output_size,
+            dropout=0.2
+        ).to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=10
+        )
+
+    def train(self, X_train, y_train, X_val, y_val, verbose=True):
+        self._build_model()
+
+        train_dataset = TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train))
+        val_dataset = TensorDataset(torch.FloatTensor(X_val), torch.FloatTensor(y_val))
+
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False)
+
+        best_val_loss = float('inf')
+
+        for epoch in range(self.num_epochs):
+            self.model.train()
+            train_loss = 0.0
+            for batch_X, batch_y in train_loader:
+                batch_X = batch_X.to(self.device)
+                batch_y = batch_y.to(self.device)
+
+                self.optimizer.zero_grad()
+                outputs = self.model(batch_X)
+                loss = self.criterion(outputs, batch_y)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                train_loss += loss.item() * batch_X.size(0)
+
+            train_loss /= len(train_loader.dataset)
+
+            self.model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for batch_X, batch_y in val_loader:
+                    batch_X = batch_X.to(self.device)
+                    batch_y = batch_y.to(self.device)
+                    outputs = self.model(batch_X)
+                    loss = self.criterion(outputs, batch_y)
+                    val_loss += loss.item() * batch_X.size(0)
+
+            val_loss /= len(val_loader.dataset)
+
+            self.train_losses.append(train_loss)
+            self.val_losses.append(val_loss)
+            self.scheduler.step(val_loss)
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                self.save(os.path.join(self.model_dir, "lstm_best.pth"))
+
+            if verbose and (epoch + 1) % 10 == 0:
+                print(f"Epoch {epoch + 1}/{self.num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+
+        self.load(os.path.join(self.model_dir, "lstm_best.pth"))
+        print(f"训练完成，最佳验证损失: {best_val_loss:.6f}")
+        return self
+
+    def predict(self, X_test):
+        self.model.eval()
+        X_tensor = torch.FloatTensor(X_test).to(self.device)
+        with torch.no_grad():
+            predictions = self.model(X_tensor)
+        return predictions.cpu().numpy()
+
+    def evaluate(self, X_test, y_test):
+        y_pred = self.predict(X_test)
+
+        mse = mean_squared_error(y_test, y_pred)
+        rmse = np.sqrt(mse)
+        mae = mean_absolute_error(y_test, y_pred)
+        r2 = r2_score(y_test, y_pred)
+
+        step_metrics = []
+        for step in range(y_test.shape[1]):
+            step_mse = mean_squared_error(y_test[:, step], y_pred[:, step])
+            step_mae = mean_absolute_error(y_test[:, step], y_pred[:, step])
+            step_metrics.append({'step': step, 'mse': step_mse, 'mae': step_mae})
+
+        metrics = {'mse': mse, 'rmse': rmse, 'mae': mae, 'r2': r2, 'step_metrics': step_metrics}
+
+        print(f"\nLSTM评估结果:")
+        print(f"  MSE: {mse:.6f}")
+        print(f"  RMSE: {rmse:.6f}")
+        print(f"  MAE: {mae:.6f}")
+        print(f"  R²: {r2:.6f}")
+
+        return metrics, y_pred
+
+    def save(self, path: str):
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'input_size': self.input_size,
+            'output_size': self.output_size,
+            'hidden_size': self.hidden_size,
+            'num_layers': self.num_layers,
+            'train_losses': self.train_losses,
+            'val_losses': self.val_losses
+        }, path)
+
+    def load(self, path: str):
+        checkpoint = torch.load(path, map_location=self.device)
+        self.input_size = checkpoint['input_size']
+        self.output_size = checkpoint['output_size']
+        self.hidden_size = checkpoint['hidden_size']
+        self.num_layers = checkpoint['num_layers']
+        self._build_model()
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.train_losses = checkpoint.get('train_losses', [])
+        self.val_losses = checkpoint.get('val_losses', [])
+        print(f"模型已从 {path} 加载")
+        return self
+
+
+# ============================================================
+# 4. Transformer模型
+# ============================================================
+
+class PositionalEncoding(nn.Module):
+    """位置编码"""
+
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1), :]
+
+
+class TransformerModel(nn.Module):
+    """Transformer时间序列预测模型"""
+
+    def __init__(self, input_size: int, d_model: int = 64, nhead: int = 4,
+                 num_layers: int = 3, output_size: int = 6, dropout: float = 0.1,
+                 max_len: int = 500):
+        super(TransformerModel, self).__init__()
+        self.d_model = d_model
+        self.input_projection = nn.Linear(input_size, d_model)
+        self.positional_encoding = PositionalEncoding(d_model, max_len)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=d_model * 4,
+            dropout=dropout, batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(d_model, output_size)
+
+    def forward(self, x):
+        x = self.input_projection(x)
+        x = self.positional_encoding(x)
+        x = self.transformer_encoder(x)
+        x = x[:, -1, :]
+        x = self.dropout(x)
+        output = self.fc(x)
+        return output
+
+
+class TransformerEngine:
+    """Transformer模型训练和评估引擎"""
+
+    def __init__(self, input_size: int, output_size: int = 6,
+                 d_model: int = 64, nhead: int = 4, num_layers: int = 3,
+                 learning_rate: float = 1e-4, batch_size: int = 64,
+                 num_epochs: int = 100, device: str = 'cuda',
+                 model_dir: str = "./checkpoints"):
+
+        self.input_size = input_size
+        self.output_size = output_size
+        self.d_model = d_model
+        self.nhead = nhead
+        self.num_layers = num_layers
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.num_epochs = num_epochs
+        self.device = device if torch.cuda.is_available() else 'cpu'
+        self.model_dir = model_dir
+        os.makedirs(model_dir, exist_ok=True)
+
+        self.model = None
+        self.optimizer = None
+        self.criterion = nn.MSELoss()
+        self.train_losses = []
+        self.val_losses = []
+
+        print(f"使用设备: {self.device}")
+
+    def _build_model(self):
+        self.model = TransformerModel(
+            input_size=self.input_size, d_model=self.d_model,
+            nhead=self.nhead, num_layers=self.num_layers,
+            output_size=self.output_size, dropout=0.1
+        ).to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=10
+        )
+
+    def train(self, X_train, y_train, X_val, y_val, verbose=True):
+        self._build_model()
+
+        train_dataset = TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train))
+        val_dataset = TensorDataset(torch.FloatTensor(X_val), torch.FloatTensor(y_val))
+
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False)
+
+        best_val_loss = float('inf')
+
+        for epoch in range(self.num_epochs):
+            self.model.train()
+            train_loss = 0.0
+            for batch_X, batch_y in train_loader:
+                batch_X = batch_X.to(self.device)
+                batch_y = batch_y.to(self.device)
+
+                self.optimizer.zero_grad()
+                outputs = self.model(batch_X)
+                loss = self.criterion(outputs, batch_y)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                train_loss += loss.item() * batch_X.size(0)
+
+            train_loss /= len(train_loader.dataset)
+
+            self.model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for batch_X, batch_y in val_loader:
+                    batch_X = batch_X.to(self.device)
+                    batch_y = batch_y.to(self.device)
+                    outputs = self.model(batch_X)
+                    loss = self.criterion(outputs, batch_y)
+                    val_loss += loss.item() * batch_X.size(0)
+
+            val_loss /= len(val_loader.dataset)
+
+            self.train_losses.append(train_loss)
+            self.val_losses.append(val_loss)
+            self.scheduler.step(val_loss)
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                self.save(os.path.join(self.model_dir, "transformer_best.pth"))
+
+            if verbose and (epoch + 1) % 10 == 0:
+                print(f"Epoch {epoch + 1}/{self.num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+
+        self.load(os.path.join(self.model_dir, "transformer_best.pth"))
+        print(f"训练完成，最佳验证损失: {best_val_loss:.6f}")
+        return self
+
+    def predict(self, X_test):
+        self.model.eval()
+        X_tensor = torch.FloatTensor(X_test).to(self.device)
+        with torch.no_grad():
+            predictions = self.model(X_tensor)
+        return predictions.cpu().numpy()
+
+    def evaluate(self, X_test, y_test):
+        y_pred = self.predict(X_test)
+
+        mse = mean_squared_error(y_test, y_pred)
+        rmse = np.sqrt(mse)
+        mae = mean_absolute_error(y_test, y_pred)
+        r2 = r2_score(y_test, y_pred)
+
+        step_metrics = []
+        for step in range(y_test.shape[1]):
+            step_mse = mean_squared_error(y_test[:, step], y_pred[:, step])
+            step_mae = mean_absolute_error(y_test[:, step], y_pred[:, step])
+            step_metrics.append({'step': step, 'mse': step_mse, 'mae': step_mae})
+
+        metrics = {'mse': mse, 'rmse': rmse, 'mae': mae, 'r2': r2, 'step_metrics': step_metrics}
+
+        print(f"\nTransformer评估结果:")
+        print(f"  MSE: {mse:.6f}")
+        print(f"  RMSE: {rmse:.6f}")
+        print(f"  MAE: {mae:.6f}")
+        print(f"  R²: {r2:.6f}")
+
+        return metrics, y_pred
+
+    def save(self, path: str):
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'input_size': self.input_size,
+            'output_size': self.output_size,
+            'd_model': self.d_model,
+            'nhead': self.nhead,
+            'num_layers': self.num_layers,
+            'train_losses': self.train_losses,
+            'val_losses': self.val_losses
+        }, path)
+
+    def load(self, path: str):
+        checkpoint = torch.load(path, map_location=self.device)
+        self.input_size = checkpoint['input_size']
+        self.output_size = checkpoint['output_size']
+        self.d_model = checkpoint['d_model']
+        self.nhead = checkpoint['nhead']
+        self.num_layers = checkpoint['num_layers']
+        self._build_model()
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.train_losses = checkpoint.get('train_losses', [])
+        self.val_losses = checkpoint.get('val_losses', [])
+        print(f"模型已从 {path} 加载")
+        return self
+
+
+# ============================================================
+# 5. 迭代式滚动预测
+# ============================================================
+
+class IterativeLSTMPredictor:
+    """LSTM模型的迭代预测器"""
+
+    def __init__(self, model, seq_length: int, n_features: int, target_col_idx: int = 0):
+        self.model = model
+        self.seq_length = seq_length
+        self.n_features = n_features
+        self.target_col_idx = target_col_idx
+
+    def predict(self, X: np.ndarray, n_steps: int) -> np.ndarray:
+        predictions = np.zeros((X.shape[0], n_steps))
+
+        for i in range(X.shape[0]):
+            current_seq = X[i].copy()
+
+            for step in range(n_steps):
+                input_tensor = torch.FloatTensor(current_seq).unsqueeze(0)
+                if torch.cuda.is_available():
+                    input_tensor = input_tensor.cuda()
+
+                with torch.no_grad():
+                    pred = self.model(input_tensor)
+                    if pred.shape[1] > 1:
+                        pred_val = pred[0, 0].item()
+                    else:
+                        pred_val = pred[0, 0].item()
+
+                predictions[i, step] = pred_val
+
+                new_step = current_seq[-1].copy()
+                new_step[self.target_col_idx] = pred_val
+                current_seq = np.vstack([current_seq[1:], new_step])
+
+        return predictions
+
+
+# ============================================================
+# 6. 评估与可视化
+# ============================================================
+
+def plot_predictions(y_true: np.ndarray, y_pred: np.ndarray,
+                     title: str = "预测结果对比",
+                     save_path: str = None, n_steps: int = 6):
+    """绘制预测结果对比图"""
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    axes = axes.flatten()
+
+    n_samples = min(100, len(y_true))
+
+    for i in range(min(n_steps, 6)):
+        ax = axes[i]
+        ax.plot(y_true[:n_samples, i], label='True', alpha=0.7)
+        ax.plot(y_pred[:n_samples, i], label='Predicted', alpha=0.7)
+        ax.set_title(f'Step {i + 1}')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    plt.suptitle(title)
+    plt.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"图表已保存到: {save_path}")
+
+    plt.show()
+
+
+def plot_scatter(y_true: np.ndarray, y_pred: np.ndarray,
+                 title: str = "真实值 vs 预测值",
+                 save_path: str = None):
+    """绘制散点图"""
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    y_true_flat = y_true.flatten()
+    y_pred_flat = y_pred.flatten()
+
+    ax.scatter(y_true_flat, y_pred_flat, alpha=0.3, s=5)
+    ax.plot([y_true_flat.min(), y_true_flat.max()],
+            [y_true_flat.min(), y_true_flat.max()],
+            'r--', linewidth=2, label='理想预测')
+    ax.set_xlabel('真实值')
+    ax.set_ylabel('预测值')
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    r2 = r2_score(y_true_flat, y_pred_flat)
+    ax.text(0.05, 0.95, f'R² = {r2:.4f}', transform=ax.transAxes,
+            fontsize=12, verticalalignment='top')
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"图表已保存到: {save_path}")
+
+    plt.show()
+
+
+def plot_correlation_matrix(df: pd.DataFrame, title: str = "特征相关性矩阵",
+                            save_path: str = None, figsize: tuple = (12, 10)):
+    """绘制特征相关性热力图"""
+    numeric_df = df.select_dtypes(include=[np.number])
+
+    plt.figure(figsize=figsize)
+    corr_matrix = numeric_df.corr()
+
+    mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
+    sns.heatmap(corr_matrix, mask=mask, annot=False, cmap='coolwarm',
+                center=0, square=True, linewidths=0.5, cbar_kws={"shrink": 0.8})
+    plt.title(title)
+    plt.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"图表已保存到: {save_path}")
+
+    plt.show()
+
+
+def plot_loss_curves(train_losses: list, val_losses: list,
+                     title: str = "训练损失曲线", save_path: str = None):
+    """绘制训练和验证损失曲线"""
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    ax.plot(train_losses, label='Training Loss', linewidth=2)
+    ax.plot(val_losses, label='Validation Loss', linewidth=2)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_yscale('log')
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"图表已保存到: {save_path}")
+
+    plt.show()
+
+
+def plot_step_errors(step_metrics: list, title: str = "各预测步的误差",
+                     save_path: str = None):
+    """绘制各预测步的MSE和MAE"""
+    steps = [m['step'] for m in step_metrics]
+    mse_values = [m['mse'] for m in step_metrics]
+    mae_values = [m['mae'] for m in step_metrics]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    x = np.arange(len(steps))
+    width = 0.35
+
+    ax.bar(x - width / 2, mse_values, width, label='MSE', alpha=0.8)
+    ax.bar(x + width / 2, mae_values, width, label='MAE', alpha=0.8)
+
+    ax.set_xlabel('预测步')
+    ax.set_ylabel('误差')
+    ax.set_title(title)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'Step {s + 1}' for s in steps])
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"图表已保存到: {save_path}")
+
+    plt.show()
+
+
+def compare_models(metrics_dict: dict, title: str = "模型性能对比",
+                   save_path: str = None):
+    """对比多个模型的性能"""
+    model_names = list(metrics_dict.keys())
+    metric_names = ['mse', 'rmse', 'mae', 'r2']
+    metric_labels = ['MSE', 'RMSE', 'MAE', 'R²']
+
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+
+    for i, (metric, label) in enumerate(zip(metric_names, metric_labels)):
+        ax = axes[i]
+        values = [metrics_dict[name][metric] for name in model_names]
+        colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+
+        bars = ax.bar(model_names, values, color=colors[:len(model_names)])
+        ax.set_title(label)
+        ax.set_xticklabels(model_names, rotation=15)
+        ax.grid(True, alpha=0.3)
+
+        for bar, val in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01 * max(values),
+                    f'{val:.4f}', ha='center', va='bottom', fontsize=9)
+
+    plt.suptitle(title)
+    plt.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"图表已保存到: {save_path}")
+
+    plt.show()
+
+
+def plot_data_distribution(df: pd.DataFrame, target_cols: list,
+                           save_path: str = None):
+    """绘制数据分布图"""
+    n_cols = len(target_cols)
+    fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 4))
+    if n_cols == 1:
+        axes = [axes]
+
+    for ax, col in zip(axes, target_cols):
+        ax.hist(df[col].dropna(), bins=50, alpha=0.7, color='blue')
+        ax.set_title(f'{col} 分布')
+        ax.set_xlabel(col)
+        ax.set_ylabel('频率')
+        ax.axvline(df[col].mean(), color='red', linestyle='--',
+                   label=f'均值: {df[col].mean():.2f}')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    plt.suptitle("数据分布图")
+    plt.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"图表已保存到: {save_path}")
+
+    plt.show()
+
+
+# ============================================================
+# 7. 主程序
+# ============================================================
+
+def main():
+    """主函数"""
+    print("=" * 60)
+    print("风速序列预测 - 机器学习项目")
+    print("=" * 60)
+
+    # ========== 配置 ==========
+    TARGET_COL = '10m_速度平均'
+    SEQ_LENGTH = 48  # 8小时 = 48步 (10分钟间隔)
+    PRED_STEPS_1H = 6  # 未来1小时
+    PRED_STEPS_16H = 96  # 未来16小时
+
+    # ========== 1. 数据准备 ==========
+    print("\n" + "=" * 60)
+    print("第1步: 数据加载与预处理")
+    print("=" * 60)
+
+    loader = WindDataLoader()
+    data = loader.prepare_data(
+        target_col=TARGET_COL,
+        seq_length=SEQ_LENGTH,
+        pred_steps=PRED_STEPS_1H,
+        normalize=True
+    )
+
+    X_train, y_train = data['X_train'], data['y_train']
+    X_val, y_val = data['X_val'], data['y_val']
+    X_test, y_test = data['X_test'], data['y_test']
+    feature_cols = data['feature_cols']
+
+    print(f"\n数据形状汇总:")
+    print(f"  特征维度: {len(feature_cols)}")
+    print(f"  X_train: {X_train.shape}, y_train: {y_train.shape}")
+    print(f"  X_val: {X_val.shape}, y_val: {y_val.shape}")
+    print(f"  X_test: {X_test.shape}, y_test: {y_test.shape}")
+
+    # ========== 2. 数据可视化 ==========
+    print("\n" + "=" * 60)
+    print("第2步: 数据可视化")
+    print("=" * 60)
+
+    os.makedirs("./results/figures", exist_ok=True)
+
+    plot_data_distribution(
+        data['merged_df'],
+        target_cols=['10m_速度平均', '50m_速度平均', '100m_速度平均'],
+        save_path="./results/figures/data_distribution.png"
+    )
+
+    plot_correlation_matrix(
+        data['train_df'].select_dtypes(include=[np.number]).iloc[:, :20],
+        save_path="./results/figures/correlation_matrix.png"
+    )
+
+    # ========== 3. 模型训练与评估（1小时预测） ==========
+    print("\n" + "=" * 60)
+    print("第3步: 模型训练与评估（预测未来1小时）")
+    print("=" * 60)
+
+    results = {}
+    all_predictions = {}
+    input_size = X_train.shape[2]
+
+    # 3.1 线性回归
+    print("\n--- 3.1 线性回归 ---")
+    lr_model = LinearRegressionModel()
+    lr_model.fit(X_train, y_train)
+    lr_metrics = lr_model.evaluate(X_test, y_test)
+    lr_pred = lr_model.predict(X_test)
+    lr_model.save("linear_model_1h.pkl")
+
+    results['Linear Regression'] = lr_metrics
+    all_predictions['Linear Regression'] = lr_pred
+
+    # 3.2 LSTM
+    print("\n--- 3.2 LSTM ---")
+    lstm_engine = LSTMEngine(
+        input_size=input_size, output_size=PRED_STEPS_1H,
+        hidden_size=64, num_layers=2, batch_size=64,
+        num_epochs=100, learning_rate=1e-3
+    )
+    lstm_engine.train(X_train, y_train, X_val, y_val)
+    lstm_metrics, lstm_pred = lstm_engine.evaluate(X_test, y_test)
+    lstm_engine.save("./checkpoints/lstm_1h.pth")
+
+    results['LSTM'] = lstm_metrics
+    all_predictions['LSTM'] = lstm_pred
+
+    plot_loss_curves(
+        lstm_engine.train_losses, lstm_engine.val_losses,
+        title="LSTM 训练损失曲线",
+        save_path="./results/figures/lstm_loss_curve.png"
+    )
+
+    # 3.3 Transformer
+    print("\n--- 3.3 Transformer ---")
+    transformer_engine = TransformerEngine(
+        input_size=input_size, output_size=PRED_STEPS_1H,
+        d_model=64, nhead=4, num_layers=3,
+        batch_size=64, num_epochs=100, learning_rate=1e-4
+    )
+    transformer_engine.train(X_train, y_train, X_val, y_val)
+    transformer_metrics, transformer_pred = transformer_engine.evaluate(X_test, y_test)
+    transformer_engine.save("./checkpoints/transformer_1h.pth")
+
+    results['Transformer'] = transformer_metrics
+    all_predictions['Transformer'] = transformer_pred
+
+    plot_loss_curves(
+        transformer_engine.train_losses, transformer_engine.val_losses,
+        title="Transformer 训练损失曲线",
+        save_path="./results/figures/transformer_loss_curve.png"
+    )
+
+    # ========== 4. 迭代式滚动预测对比 ==========
+    print("\n" + "=" * 60)
+    print("第4步: 迭代式滚动预测对比")
+    print("=" * 60)
+
+    print("\n--- 训练单步LSTM用于迭代预测 ---")
+    lstm_single = LSTMEngine(
+        input_size=input_size, output_size=1,
+        hidden_size=64, num_layers=2,
+        batch_size=64, num_epochs=80, learning_rate=1e-3
+    )
+    y_train_single = y_train[:, 0:1]
+    y_val_single = y_val[:, 0:1]
+    lstm_single.train(X_train, y_train_single, X_val, y_val_single, verbose=False)
+
+    print("\n--- 迭代预测1小时 ---")
+    target_idx = feature_cols.index(TARGET_COL) if TARGET_COL in feature_cols else 0
+    iterative_predictor = IterativeLSTMPredictor(
+        lstm_single.model, SEQ_LENGTH, input_size, target_col_idx=target_idx
+    )
+    y_pred_iterative = iterative_predictor.predict(X_test, PRED_STEPS_1H)
+
+    iterative_mse = mean_squared_error(y_test, y_pred_iterative)
+    iterative_rmse = np.sqrt(iterative_mse)
+    iterative_mae = mean_absolute_error(y_test, y_pred_iterative)
+    iterative_r2 = r2_score(y_test, y_pred_iterative)
+
+    iterative_metrics = {
+        'mse': iterative_mse, 'rmse': iterative_rmse,
+        'mae': iterative_mae, 'r2': iterative_r2,
+        'step_metrics': [
+            {'step': i, 'mse': mean_squared_error(y_test[:, i], y_pred_iterative[:, i]),
+             'mae': mean_absolute_error(y_test[:, i], y_pred_iterative[:, i])}
+            for i in range(PRED_STEPS_1H)
+        ]
+    }
+    results['LSTM (Iterative)'] = iterative_metrics
+    all_predictions['LSTM (Iterative)'] = y_pred_iterative
+
+    print(f"  迭代预测 MSE: {iterative_mse:.6f}")
+    print(f"  直接预测 MSE: {results['LSTM']['mse']:.6f}")
+
+    # ========== 5. 16小时预测 ==========
+    print("\n" + "=" * 60)
+    print("第5步: 16小时预测")
+    print("=" * 60)
+
+    data_16h = loader.prepare_data(
+        target_col=TARGET_COL,
+        seq_length=SEQ_LENGTH,
+        pred_steps=PRED_STEPS_16H,
+        normalize=True
+    )
+
+    X_train_16, y_train_16 = data_16h['X_train'], data_16h['y_train']
+    X_val_16, y_val_16 = data_16h['X_val'], data_16h['y_val']
+    X_test_16, y_test_16 = data_16h['X_test'], data_16h['y_test']
+
+    print("\n--- 训练LSTM用于16小时预测 ---")
+    lstm_16h = LSTMEngine(
+        input_size=input_size, output_size=PRED_STEPS_16H,
+        hidden_size=128, num_layers=2, batch_size=32,
+        num_epochs=80, learning_rate=1e-3
+    )
+    lstm_16h.train(X_train_16, y_train_16, X_val_16, y_val_16)
+    lstm_metrics_16h, lstm_pred_16h = lstm_16h.evaluate(X_test_16, y_test_16)
+    lstm_16h.save("./checkpoints/lstm_16h.pth")
+
+    # ========== 6. 结果可视化 ==========
+    print("\n" + "=" * 60)
+    print("第6步: 结果可视化")
+    print("=" * 60)
+
+    # 模型对比（排除迭代和16h）
+    compare_models(
+        {k: v for k, v in results.items() if k not in ['LSTM (Iterative)']},
+        title="1小时预测 - 模型性能对比",
+        save_path="./results/figures/model_comparison_1h.png"
+    )
+
+    # 各预测步误差
+    for model_name, metrics in results.items():
+        if 'step_metrics' in metrics:
+            plot_step_errors(
+                metrics['step_metrics'],
+                title=f"{model_name} - 各预测步误差",
+                save_path=f"./results/figures/step_errors_{model_name.replace(' ', '_')}.png"
+            )
+
+    # 绘制各模型的预测结果对比
+    for model_name, pred in all_predictions.items():
+        plot_predictions(
+            y_test, pred,
+            title=f"{model_name} - 预测结果对比 (1小时)",
+            save_path=f"./results/figures/predictions_{model_name.replace(' ', '_')}.png",
+            n_steps=6
+        )
+        plot_scatter(
+            y_test, pred,
+            title=f"{model_name} - 真实值 vs 预测值",
+            save_path=f"./results/figures/scatter_{model_name.replace(' ', '_')}.png"
+        )
+
+    # 16小时预测结果
+    plot_predictions(
+        y_test_16, lstm_pred_16h,
+        title="LSTM - 16小时预测结果对比",
+        save_path="./results/figures/predictions_16h.png",
+        n_steps=12
+    )
+
+    # ========== 7. 结果汇总 ==========
+    print("\n" + "=" * 60)
+    print("第7步: 结果汇总")
+    print("=" * 60)
+
+    summary = []
+    for model_name, metrics in results.items():
+        summary.append({
+            'Model': model_name,
+            'MSE': metrics['mse'],
+            'RMSE': metrics['rmse'],
+            'MAE': metrics['mae'],
+            'R²': metrics['r2']
+        })
+
+    summary_df = pd.DataFrame(summary)
+    print("\n模型性能对比表:")
+    print(summary_df.to_string(index=False))
+    summary_df.to_csv("./results/metrics_summary.csv", index=False)
+    print("\n结果已保存到 ./results/metrics_summary.csv")
+
+    summary_16h = pd.DataFrame([{
+        'Model': 'LSTM (16h)',
+        'MSE': lstm_metrics_16h['mse'],
+        'RMSE': lstm_metrics_16h['rmse'],
+        'MAE': lstm_metrics_16h['mae'],
+        'R²': lstm_metrics_16h['r2']
+    }])
+    summary_16h.to_csv("./results/metrics_summary_16h.csv", index=False)
+    print("\n16小时预测结果:")
+    print(summary_16h.to_string(index=False))
+
+    print("\n" + "=" * 60)
+    print("项目运行完成！")
+    print("=" * 60)
+    print("\n生成的文件:")
+    print("  - ./checkpoints/*.pth  (模型参数)")
+    print("  - ./results/figures/   (可视化图表)")
+    print("  - ./results/*.csv      (评估指标)")
+    print("  - ./data/processed/    (处理后的数据)")
+
+
+if __name__ == "__main__":
+    main()
