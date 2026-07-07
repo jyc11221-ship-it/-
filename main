@@ -55,8 +55,7 @@ class WindDataLoader:
             print(f"  下载 {name} 数据集...")
             try:
                 dataset = load_dataset(repo, split='train',
-                                       cache_dir=self.data_dir,
-                                       force_redownload=force_download)
+                                       cache_dir=self.data_dir)
                 df = dataset.to_pandas()
                 datasets_dict[name] = df
                 print(f"    {name}: {len(df)} 行, {len(df.columns)} 列")
@@ -234,7 +233,7 @@ class WindDataLoader:
         return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32), np.array(timestamps)
 
     def prepare_data(self,
-                     target_col: str = '10m_速度平均',
+                     target_col: str = '10m_SpeedAvg',  # 注意大写 A
                      seq_length: int = 48,
                      pred_steps: int = 6,
                      normalize: bool = True) -> dict:
@@ -1006,7 +1005,7 @@ def main():
     print("=" * 60)
 
     # ========== 配置 ==========
-    TARGET_COL = '10m_速度平均'
+    TARGET_COL = '10m_SpeedAvg'  # 注意大写 A
     SEQ_LENGTH = 48  # 8小时 = 48步 (10分钟间隔)
     PRED_STEPS_1H = 6  # 未来1小时
     PRED_STEPS_16H = 96  # 未来16小时
@@ -1023,7 +1022,7 @@ def main():
         pred_steps=PRED_STEPS_1H,
         normalize=True
     )
-
+    print("合并后的所有列名:", data['merged_df'].columns.tolist())
     X_train, y_train = data['X_train'], data['y_train']
     X_val, y_val = data['X_val'], data['y_val']
     X_test, y_test = data['X_test'], data['y_test']
@@ -1044,7 +1043,7 @@ def main():
 
     plot_data_distribution(
         data['merged_df'],
-        target_cols=['10m_速度平均', '50m_速度平均', '100m_速度平均'],
+        target_cols=['10m_SpeedAvg', '50m_SpeedAvg', '100m_SpeedAvg'],  # 注意大写 A
         save_path="./results/figures/data_distribution.png"
     )
 
